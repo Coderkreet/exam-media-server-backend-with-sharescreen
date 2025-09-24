@@ -57,7 +57,7 @@ const webRtcTransportOptions = {
   listenIps: [
     { 
       ip: '0.0.0.0', 
-      announcedIp: process.env.ANNOUNCED_IP || '192.168.0.13'  // ✅ Fixed default IP
+      announcedIp: process.env.ANNOUNCED_IP || '192.168.9.210'  // ✅ Fixed default IP
     }
   ],
   enableUdp: true,
