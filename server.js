@@ -48,7 +48,7 @@ let mediasoupRouter;
 const rooms = new Map();
 const peers = new Map();
 
-// ✅ FIXED Room class - Only count ACTUAL STUDENTS
+// ✅ UPDATED Room class with CLIENT support
 class Room {
   constructor(roomId) {
     this.id = roomId;
@@ -86,7 +86,7 @@ class Room {
     }
   }
 
-  // ✅ FIXED: Get only ACTUAL STUDENTS (not proctors or disconnected peers)
+  // ✅ Get only ACTUAL STUDENTS (not proctors, clients, or disconnected peers)
   getActualStudents() {
     const actualStudents = Array.from(this.peers.values()).filter(peer => {
       return peer.role === 'student' && 
@@ -109,7 +109,13 @@ class Room {
     // Silent operation
   }
 
-  // ✅ FIXED: Paginated data based on ACTUAL STUDENTS only
+  // ✅ Get peer userName by peerId
+  getPeerUserName(peerId) {
+    const peer = this.peers.get(peerId);
+    return peer ? peer.getUserName() : peerId;
+  }
+
+  // ✅ Paginated data with userName support
   getPaginatedProducersData(page = 1) {
     const actualStudents = this.getActualStudents();
     const totalActualStudents = actualStudents.length;
@@ -140,10 +146,12 @@ class Room {
     
     for (const [producerId, data] of this.producers) {
       if (currentPageStudentIds.includes(data.peerId)) {
+        const peer = this.peers.get(data.peerId);
         const producerInfo = {
           producerId,
           peerId: data.peerId,
-          kind: data.producer.kind
+          kind: data.producer.kind,
+          userName: peer ? peer.getUserName() : data.peerId
         };
         
         if (data.streamType === 'camera') {
@@ -168,7 +176,6 @@ class Room {
     };
   }
 
-  // ✅ FIXED: Summary based on ACTUAL students
   getActiveStudentsSummary() {
     const actualStudents = this.getActualStudents();
     const studentsWithStreams = actualStudents.filter(student => {
@@ -177,6 +184,8 @@ class Room {
 
     const students = actualStudents.map(student => ({
       peerId: student.id,
+      userId: student.getUserId(),
+      userName: student.getUserName(),
       hasStreams: studentsWithStreams.some(s => s.id === student.id),
       producerCount: Array.from(this.producers.values()).filter(p => p.peerId === student.id).length
     }));
@@ -202,6 +211,11 @@ class Room {
     return peers;
   }
 
+  // ✅ NEW: Get clients
+  getClients() {
+    return this.getPeersByRole('client');
+  }
+
   getProctors() {
     return this.getPeersByRole('proctor');
   }
@@ -209,9 +223,14 @@ class Room {
   getStudents() {
     return this.getPeersByRole('student');
   }
+
+  // ✅ NEW: Get viewers (proctors + clients)
+  getViewers() {
+    return [...this.getProctors(), ...this.getClients()];
+  }
 }
 
-// ✅ ENHANCED Peer class with connection tracking
+// ✅ UPDATED Peer class with CLIENT support
 class Peer {
   constructor(id, socket) {
     this.id = id;
@@ -223,6 +242,9 @@ class Peer {
     this.roomId = null;
     this.streamTypes = new Set();
     this.role = null;
+    this.userId = null;
+    this.userName = null;
+    this.clientId = null; // ✅ NEW: Add clientId field
     this.connected = true;
     
     if (socket) {
@@ -233,8 +255,19 @@ class Peer {
   }
 
   setRoom(roomId) { this.roomId = roomId; }
-  setRole(role) { 
-    this.role = role; 
+  setRole(role) { this.role = role; }
+  setUserId(userId) { this.userId = userId; }
+  getUserId() { return this.userId; }
+  setUserName(userName) { this.userName = userName; }
+  getUserName() { return this.userName; }
+  
+  // ✅ NEW: Client ID methods
+  setClientId(clientId) { this.clientId = clientId; }
+  getClientId() { return this.clientId; }
+
+  // ✅ NEW: Check if peer is a viewer (proctor or client)
+  isViewer() {
+    return this.role === 'proctor' || this.role === 'client';
   }
 
   async getOrCreateSendTransport() {
@@ -275,7 +308,6 @@ class Peer {
   close() {
     this.connected = false;
     
-    // Clean up transport ports when peer closes
     if (this.sendTransport && !this.sendTransport.closed) {
       config.portMonitor.removeTransportPorts(this.sendTransport.id);
       this.sendTransport.close();
@@ -316,11 +348,9 @@ const initializeMediasoup = async () => {
 const createWebRtcTransport = async () => {
   const transport = await mediasoupRouter.createWebRtcTransport(config.webRtcTransportOptions);
 
-  // Track ports when transport is created
   const transportId = transport.id;
-  const estimatedPorts = []; // MediaSoup doesn't expose exact ports, so we estimate
+  const estimatedPorts = [];
   
-  // Estimate 2 ports per transport (RTP + RTCP)
   const basePort = config.workerSettings.rtcMinPort + (Math.random() * 1000);
   estimatedPorts.push(Math.floor(basePort), Math.floor(basePort) + 1);
   
@@ -347,11 +377,11 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     activeRooms: rooms.size,
     activePeers: peers.size,
-    server: 'MediaSoup SFU Server v2.3 - PORT MONITOR ONLY',
+    server: 'MediaSoup SFU Server v2.5 - With Client Support',
     portStats: portStats,
     pagination: {
       studentsPerPage: 12,
-      description: 'Fixed: Only actual connected students counted'
+      description: 'Enhanced with Client viewing support alongside Proctor viewing'
     }
   });
 });
@@ -367,15 +397,25 @@ app.get('/api/rtp-capabilities', (req, res) => {
   }
 });
 
+// ✅ UPDATED: Setup transports with CLIENT support
 app.post('/api/setup-transports', async (req, res) => {
   try {
-    const { peerId, role } = req.body;
+    const { peerId, role, examId, userId, userName, clientId } = req.body;
+    
+    const roleDisplay = role === 'client' ? `Client ${clientId}` : role;
+    console.log(`🔧 Setting up transports for ${roleDisplay} ${userName} (${userId}) in exam ${examId}`);
 
     if (!peers.has(peerId)) {
       throw new Error('Peer not found');
     }
 
     const peer = peers.get(peerId);
+    
+    // Store additional metadata
+    if (userId) peer.setUserId(userId);
+    if (userName) peer.setUserName(userName);
+    if (clientId && role === 'client') peer.setClientId(clientId);
+    
     const sendTransport = await peer.getOrCreateSendTransport();
     const recvTransport = await peer.getOrCreateRecvTransport();
 
@@ -397,19 +437,31 @@ app.post('/api/setup-transports', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('❌ Setup transports error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// ✅ UPDATED: Connect transports with CLIENT support
 app.post('/api/connect-transports', async (req, res) => {
   try {
-    const { peerId, sendDtlsParameters, recvDtlsParameters } = req.body;
+    const { 
+      peerId, 
+      sendDtlsParameters, 
+      recvDtlsParameters,
+      examId,
+      userId,
+      userName,
+      clientId
+    } = req.body;
+    
+    const peer = peers.get(peerId);
+    const roleDisplay = peer && peer.role === 'client' ? `Client ${clientId || peer.getClientId()}` : 'User';
+    console.log(`🔗 Connecting transports for ${roleDisplay} ${userName} (${userId}) in exam ${examId}`);
 
-    if (!peers.has(peerId)) {
+    if (!peer) {
       throw new Error('Peer not found');
     }
-
-    const peer = peers.get(peerId);
 
     if (sendDtlsParameters && peer.sendTransport) {
       await peer.sendTransport.connect({ dtlsParameters: sendDtlsParameters });
@@ -421,13 +473,26 @@ app.post('/api/connect-transports', async (req, res) => {
 
     res.json({ success: true, message: 'Transports connected successfully' });
   } catch (error) {
+    console.error('❌ Connect transports error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// ✅ UPDATED: Produce with CLIENT notification support
 app.post('/api/produce', async (req, res) => {
   try {
-    const { peerId, kind, rtpParameters, streamType = 'camera' } = req.body;
+    const { 
+      peerId, 
+      kind, 
+      rtpParameters, 
+      streamType = 'camera',
+      examId,
+      userId,
+      userName,
+      clientId
+    } = req.body;
+    
+    console.log(`📹 Creating producer for ${userName} (${userId}) - ${streamType} in exam ${examId}`);
     
     if (kind === 'audio') {
       return res.status(400).json({ 
@@ -454,14 +519,18 @@ app.post('/api/produce', async (req, res) => {
       const room = rooms.get(roomId);
       room.addProducer(producer, peerId, streamType);
 
-      const proctors = room.getProctors();
+      // ✅ UPDATED: Notify ALL VIEWERS (proctors + clients)
+      const viewers = room.getViewers();
       
-      proctors.forEach(proctor => {
-        proctor.socket.emit('newProducer', {
+      viewers.forEach(viewer => {
+        viewer.socket.emit('newProducer', {
           producerId: producer.id,
           peerId: peerId,
           kind: kind,
-          streamType: streamType
+          streamType: streamType,
+          userId: userId,
+          userName: userName,
+          examId: examId
         });
       });
     }
@@ -475,11 +544,12 @@ app.post('/api/produce', async (req, res) => {
 
     res.json({ success: true, producerId: producer.id, streamType: streamType });
   } catch (error) {
+    console.error('❌ Produce error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ✅ FIXED PAGINATED BATCH CONSUME ENDPOINT
+// Keep existing batch consume endpoints unchanged
 app.post('/api/batch-consume-paginated', async (req, res) => {
   try {
     const { peerId, producerIds, rtpCapabilities, page = 1 } = req.body;
@@ -530,13 +600,16 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
         peer.removeConsumer(consumer.id);
       });
 
+      const producerPeer = room.peers.get(producerData.peerId);
+      
       consumers.push({
         consumerId: consumer.id,
         producerId: producer.id,
         peerId: producerData.peerId,
         kind: consumer.kind,
         streamType: producerData.streamType,
-        rtpParameters: consumer.rtpParameters
+        rtpParameters: consumer.rtpParameters,
+        userName: producerPeer ? producerPeer.getUserName() : producerData.peerId
       });
     }
 
@@ -548,11 +621,11 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
       message: `Page ${page} loaded with ${consumers.length} streams`
     });
   } catch (error) {
+    console.error('❌ Batch consume paginated error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Original batch consume (for backward compatibility)
 app.post('/api/batch-consume', async (req, res) => {
   try {
     const { peerId, producerIds, rtpCapabilities } = req.body;
@@ -603,13 +676,16 @@ app.post('/api/batch-consume', async (req, res) => {
         peer.removeConsumer(consumer.id);
       });
 
+      const producerPeer = room.peers.get(producerData.peerId);
+
       consumers.push({
         consumerId: consumer.id,
         producerId: producer.id,
         peerId: producerData.peerId,
         kind: consumer.kind,
         streamType: producerData.streamType,
-        rtpParameters: consumer.rtpParameters
+        rtpParameters: consumer.rtpParameters,
+        userName: producerPeer ? producerPeer.getUserName() : producerData.peerId
       });
     }
 
@@ -619,6 +695,7 @@ app.post('/api/batch-consume', async (req, res) => {
       totalCreated: consumers.length
     });
   } catch (error) {
+    console.error('❌ Batch consume error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -650,11 +727,12 @@ app.post('/api/batch-resume-consumers', async (req, res) => {
       totalResumed: resumedConsumers.length
     });
   } catch (error) {
+    console.error('❌ Batch resume consumers error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ✅ FIXED PAGINATED PRODUCERS ENDPOINTS
+// Keep existing API endpoints
 app.get('/api/exam/:examId/producers/page/:page', (req, res) => {
   const { examId, page } = req.params;
   const roomId = `exam-${examId}`;
@@ -681,7 +759,6 @@ app.get('/api/exam/:examId/producers/page/:page', (req, res) => {
   });
 });
 
-// Original producers endpoint (defaults to page 1)
 app.get('/api/exam/:examId/producers', (req, res) => {
   const { examId } = req.params;
   const roomId = `exam-${examId}`;
@@ -706,7 +783,7 @@ app.get('/api/exam/:examId/producers', (req, res) => {
   });
 });
 
-// ✅ FIXED STATS ENDPOINT - Only count actual students
+// ✅ UPDATED: Stats endpoint with CLIENT support
 app.get('/api/exam/:examId/stats', (req, res) => {
   const { examId } = req.params;
   const roomId = `exam-${examId}`;
@@ -717,6 +794,7 @@ app.get('/api/exam/:examId/stats', (req, res) => {
       examId,
       totalStudents: 0,
       connectedProctors: 0,
+      connectedClients: 0,
       students: [],
       producers: 0,
       consumers: 0
@@ -726,6 +804,8 @@ app.get('/api/exam/:examId/stats', (req, res) => {
   const actualStudents = room.getActualStudents();
   const students = actualStudents.map(peer => ({
     peerId: peer.id,
+    userId: peer.getUserId(),
+    userName: peer.getUserName(),
     hasProducers: peer.producers.size > 0,
     producerCount: peer.producers.size,
     consumerCount: peer.consumers.size,
@@ -734,6 +814,7 @@ app.get('/api/exam/:examId/stats', (req, res) => {
   }));
 
   const proctors = room.getProctors();
+  const clients = room.getClients(); // ✅ NEW
   const summary = room.getActiveStudentsSummary();
 
   res.json({
@@ -741,6 +822,8 @@ app.get('/api/exam/:examId/stats', (req, res) => {
     roomId,
     totalStudents: actualStudents.length,
     connectedProctors: proctors.length,
+    connectedClients: clients.length, // ✅ NEW
+    totalViewers: proctors.length + clients.length, // ✅ NEW
     students,
     totalProducers: room.producers.size,
     totalConsumers: actualStudents.reduce((sum, peer) => sum + peer.consumers.size, 0),
@@ -751,16 +834,28 @@ app.get('/api/exam/:examId/stats', (req, res) => {
   });
 });
 
-// ✅ Socket connection handler (silent operations)
+// ✅ UPDATED: Socket connection handler with CLIENT support
 io.on('connection', (socket) => {
-  socket.on('joinExam', ({ examId, role, userId }) => {
+  socket.on('joinExam', ({ examId, role, userId, userName, clientId }) => {
     const roomId = `exam-${examId}`;
-    const peerId = `${userId}-${socket.id}`;
+    
+    // ✅ UPDATED: Include clientId in peerId for clients
+    const peerId = role === 'client' && clientId 
+      ? `${clientId}-${userId}-${socket.id}` 
+      : `${userId}-${socket.id}`;
 
     try {
       const peer = new Peer(peerId, socket);
       peer.setRoom(roomId);
       peer.setRole(role);
+      peer.setUserId(userId);
+      peer.setUserName(userName);
+      
+      // ✅ NEW: Set clientId for client role
+      if (role === 'client' && clientId) {
+        peer.setClientId(clientId);
+      }
+      
       peers.set(peerId, peer);
 
       if (!rooms.has(roomId)) {
@@ -776,12 +871,16 @@ io.on('connection', (socket) => {
         roomId,
         peerId,
         role,
-        message: 'Successfully joined exam room'
+        userId,
+        userName,
+        clientId: clientId || null,
+        message: `Successfully joined exam room as ${role}`
       });
 
-      // Proctor logic with FIXED PAGINATION
-      if (role === 'proctor') {
+      // ✅ UPDATED: Handle CLIENT role like PROCTOR
+      if (role === 'proctor' || role === 'client') {
         const studentsSummary = room.getActiveStudentsSummary();
+        const viewerType = role === 'client' ? `Client ${clientId}` : 'Proctor';
 
         // Method 1: Immediate check - FIXED PAGINATED (Page 1 only)
         const paginatedData = room.getPaginatedProducersData(1);
@@ -821,21 +920,27 @@ io.on('connection', (socket) => {
           }
         }, 2000);
 
-        socket.to(roomId).emit('proctorJoined', {
-          proctorId: peerId,
-          message: 'Proctor joined - please refresh your streams'
+        // ✅ UPDATED: Notify students about new viewer
+        socket.to(roomId).emit('viewerJoined', {
+          viewerId: peerId,
+          viewerName: userName,
+          viewerType: role,
+          clientId: clientId || null,
+          message: `${viewerType} ${userName} joined - please refresh your streams`
         });
       }
 
       if (role === 'student') {
-        const proctors = room.getProctors();
+        // ✅ UPDATED: Notify ALL VIEWERS (proctors + clients)
+        const viewers = room.getViewers();
         
-        proctors.forEach(proctor => {
-          proctor.socket.emit('studentJoined', {
+        viewers.forEach(viewer => {
+          viewer.socket.emit('studentJoined', {
             peerId,
             userId,
+            userName,
             examId,
-            message: `Student ${userId} joined the exam`
+            message: `Student ${userName} (ID: ${userId}) joined the exam`
           });
         });
       }
@@ -844,23 +949,34 @@ io.on('connection', (socket) => {
       socket.emit('joinError', {
         error: joinError.message,
         examId,
-        role
+        role,
+        userId,
+        userName,
+        clientId: clientId || null
       });
     }
 
-    // ✅ FIXED disconnect handler with proper cleanup
+    // ✅ UPDATED: disconnect handler with CLIENT support
     socket.on('disconnect', () => {
       try {
         if (peers.has(peerId)) {
           const peer = peers.get(peerId);
-          peer.close(); // This will handle port cleanup
+          const peerUserName = peer.getUserName();
+          const peerClientId = peer.getClientId();
+          peer.close();
           peers.delete(peerId);
 
           if (rooms.has(roomId)) {
             const room = rooms.get(roomId);
             room.removePeer(peerId);
             
-            socket.to(roomId).emit('peerLeft', { peerId, role });
+            socket.to(roomId).emit('peerLeft', { 
+              peerId, 
+              role, 
+              userId,
+              userName: peerUserName,
+              clientId: peerClientId
+            });
             
             const actualStudents = room.getActualStudents();
           }
@@ -871,7 +987,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ✅ FIXED PAGINATED REFRESH REQUEST
+  // Keep existing socket handlers unchanged
   socket.on('refreshProducers', ({ examId, peerId, page = 1 }) => {
     const roomId = `exam-${examId}`;
 
@@ -898,7 +1014,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ✅ FIXED PAGE CHANGE REQUEST
   socket.on('changePage', ({ examId, peerId, page }) => {
     const roomId = `exam-${examId}`;
 
@@ -931,13 +1046,15 @@ io.on('connection', (socket) => {
 
 const startServer = async () => {
   try {
-    await initializeMediasoup();
+    await initializeMediasoup()
     
     const PORT = process.env.PORT || 5000;
     server.listen(PORT, () => {
-      config.portMonitor.logPortUsage('Server started');
+      console.log(`🚀 MediaSoup SFU Server v2.5 with CLIENT support running on port ${PORT}`);
+      config.portMonitor.logPortUsage('Server started with Client + Proctor viewing support');
     });
   } catch (error) {
+    console.error('❌ Server startup error:', error);
     process.exit(1);
   }
 };
@@ -946,6 +1063,7 @@ process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
 
 function gracefulShutdown() {
+  console.log('🛑 Graceful shutdown initiated...');
   for (const peer of peers.values()) {
     peer.close();
   }
@@ -957,10 +1075,12 @@ function gracefulShutdown() {
   }
 
   server.close(() => {
+    console.log('✅ Server closed gracefully');
     process.exit(0);
   });
 
   setTimeout(() => {
+    console.log('❌ Force shutdown after timeout');
     process.exit(1);
   }, 10000);
 }
