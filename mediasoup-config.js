@@ -185,7 +185,7 @@ const webRtcTransportOptions = {
   listenIps: [
     { 
       ip: '0.0.0.0', 
-      announcedIp: process.env.ANNOUNCED_IP || '192.168.0.113'
+      announcedIp: process.env.ANNOUNCED_IP || '192.168.9.36'
     }
   ],
   
@@ -326,7 +326,7 @@ const validateConfig = () => {
   }
   
   // Announced IP validation
-  if (!process.env.ANNOUNCED_IP && webRtcTransportOptions.listenIps[0].announcedIp === '192.168.0.113') {
+  if (!process.env.ANNOUNCED_IP && webRtcTransportOptions.listenIps[0].announcedIp === '192.168.9.36') {
     // Silent validation - no warning
   }
   

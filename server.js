@@ -5,6 +5,7 @@ const bodyParser = require('body-parser');
 const http = require('http');
 const socketIo = require('socket.io');
 const mediasoup = require('mediasoup');
+const os = require('os'); // ✅ Added for CPU detection
 const config = require('./mediasoup-config');
 
 const app = express();
@@ -43,24 +44,39 @@ const io = socketIo(server, {
   allowEIO3: true
 });
 
-let mediasoupWorker;
-let mediasoupRouter;
+// ✅ MULTI-WORKER ARCHITECTURE
+const NUM_WORKERS = 4; // Fixed 4 workers for optimal performance
+const mediasoupWorkers = [];
+const mediasoupRouters = [];
+const roomWorkerMap = new Map(); // Maps rooms to specific workers
+let nextWorkerIndex = 0; // Round-robin worker assignment
+
 const rooms = new Map();
 const peers = new Map();
 
-// ✅ UPDATED Room class with CLIENT support
+// ✅ ENHANCED Room class with WORKER ASSIGNMENT
 class Room {
-  constructor(roomId) {
+  constructor(roomId, workerIndex = 0) {
     this.id = roomId;
+    this.workerIndex = workerIndex; // ✅ NEW: Track which worker handles this room
     this.peers = new Map();
     this.producers = new Map();
     this.STUDENTS_PER_PAGE = 12;
   }
 
+  // ✅ NEW: Get the assigned worker and router for this room
+  getAssignedWorker() {
+    return mediasoupWorkers[this.workerIndex];
+  }
+
+  getAssignedRouter() {
+    return mediasoupRouters[this.workerIndex];
+  }
+
   addPeer(peer) {
     this.peers.set(peer.id, peer);
     const actualStudents = this.getActualStudents();
-    // Silent operation
+    console.log(`📊 Room ${this.id} [Worker ${this.workerIndex}]: ${actualStudents.length} students`);
   }
 
   removePeer(peerId) {
@@ -80,9 +96,12 @@ class Room {
     });
     
     const actualStudents = this.getActualStudents();
+    console.log(`📉 Room ${this.id} [Worker ${this.workerIndex}]: ${actualStudents.length} students remaining`);
     
     if (this.peers.size === 0) {
       rooms.delete(this.id);
+      roomWorkerMap.delete(this.id); // ✅ Clean up worker mapping
+      console.log(`🗑️ Room ${this.id} deleted from Worker ${this.workerIndex}`);
     }
   }
 
@@ -100,13 +119,15 @@ class Room {
   addProducer(producer, peerId, streamType) {
     this.producers.set(producer.id, { producer, peerId, streamType });
     const peer = this.peers.get(peerId);
-    // Silent operation
+    console.log(`🎥 Producer added [Worker ${this.workerIndex}]: ${streamType} from ${peerId}`);
   }
 
   removeProducer(producerId) {
     const producerData = this.producers.get(producerId);
     this.producers.delete(producerId);
-    // Silent operation
+    if (producerData) {
+      console.log(`🚫 Producer removed [Worker ${this.workerIndex}]: ${producerData.streamType} from ${producerData.peerId}`);
+    }
   }
 
   // ✅ Get peer userName by peerId
@@ -130,7 +151,8 @@ class Room {
           studentsPerPage: this.STUDENTS_PER_PAGE,
           currentPageStudents: 0,
           hasNextPage: false,
-          hasPreviousPage: false
+          hasPreviousPage: false,
+          workerIndex: this.workerIndex // ✅ Include worker info
         }
       };
     }
@@ -171,7 +193,8 @@ class Room {
         studentsPerPage: this.STUDENTS_PER_PAGE,
         currentPageStudents: currentPageStudents.length,
         hasNextPage: page < totalPages,
-        hasPreviousPage: page > 1
+        hasPreviousPage: page > 1,
+        workerIndex: this.workerIndex // ✅ Include worker info
       }
     };
   }
@@ -197,6 +220,10 @@ class Room {
       pagination: {
         studentsPerPage: this.STUDENTS_PER_PAGE,
         totalPages: Math.ceil(actualStudents.length / this.STUDENTS_PER_PAGE)
+      },
+      workerInfo: {
+        workerIndex: this.workerIndex,
+        totalWorkers: NUM_WORKERS
       }
     };
 
@@ -230,7 +257,7 @@ class Room {
   }
 }
 
-// ✅ UPDATED Peer class with CLIENT support
+// ✅ UPDATED Peer class with WORKER SUPPORT
 class Peer {
   constructor(id, socket) {
     this.id = id;
@@ -240,11 +267,12 @@ class Peer {
     this.producers = new Map();
     this.consumers = new Map();
     this.roomId = null;
+    this.workerIndex = null; // ✅ NEW: Track which worker this peer uses
     this.streamTypes = new Set();
     this.role = null;
     this.userId = null;
     this.userName = null;
-    this.clientId = null; // ✅ NEW: Add clientId field
+    this.clientId = null;
     this.connected = true;
     
     if (socket) {
@@ -261,6 +289,10 @@ class Peer {
   setUserName(userName) { this.userName = userName; }
   getUserName() { return this.userName; }
   
+  // ✅ NEW: Worker assignment
+  setWorkerIndex(workerIndex) { this.workerIndex = workerIndex; }
+  getWorkerIndex() { return this.workerIndex; }
+  
   // ✅ NEW: Client ID methods
   setClientId(clientId) { this.clientId = clientId; }
   getClientId() { return this.clientId; }
@@ -272,14 +304,14 @@ class Peer {
 
   async getOrCreateSendTransport() {
     if (!this.sendTransport || this.sendTransport.closed) {
-      this.sendTransport = await createWebRtcTransport();
+      this.sendTransport = await createWebRtcTransport(this.workerIndex);
     }
     return this.sendTransport;
   }
 
   async getOrCreateRecvTransport() {
     if (!this.recvTransport || this.recvTransport.closed) {
-      this.recvTransport = await createWebRtcTransport();
+      this.recvTransport = await createWebRtcTransport(this.workerIndex);
     }
     return this.recvTransport;
   }
@@ -333,25 +365,79 @@ class Peer {
   }
 }
 
-// Initialize MediaSoup
+// ✅ MULTI-WORKER INITIALIZATION
 const initializeMediasoup = async () => {
-  mediasoupWorker = await mediasoup.createWorker(config.workerSettings);
-  mediasoupWorker.on('died', () => {
-    process.exit(1);
-  });
+  console.log(`🚀 Initializing ${NUM_WORKERS} MediaSoup workers...`);
+  
+  for (let i = 0; i < NUM_WORKERS; i++) {
+    try {
+      const worker = await mediasoup.createWorker({
+        ...config.workerSettings,
+        // ✅ Distribute port ranges across workers to avoid conflicts
+        rtcMinPort: config.workerSettings.rtcMinPort + (i * 1000),
+        rtcMaxPort: config.workerSettings.rtcMinPort + (i * 1000) + 999
+      });
+      
+      worker.on('died', () => {
+        console.error(`💀 MediaSoup worker ${i} died`);
+        process.exit(1);
+      });
 
-  mediasoupRouter = await mediasoupWorker.createRouter({
-    mediaCodecs: config.routerOptions.mediaCodecs
-  });
+      const router = await worker.createRouter({
+        mediaCodecs: config.routerOptions.mediaCodecs
+      });
+
+      mediasoupWorkers.push(worker);
+      mediasoupRouters.push(router);
+      
+      console.log(`✅ Worker ${i} initialized with ports ${config.workerSettings.rtcMinPort + (i * 1000)}-${config.workerSettings.rtcMinPort + (i * 1000) + 999}`);
+    } catch (error) {
+      console.error(`❌ Failed to initialize worker ${i}:`, error);
+      process.exit(1);
+    }
+  }
+  
+  console.log(`🎯 All ${NUM_WORKERS} workers initialized successfully!`);
 };
 
-const createWebRtcTransport = async () => {
-  const transport = await mediasoupRouter.createWebRtcTransport(config.webRtcTransportOptions);
+// ✅ INTELLIGENT WORKER ASSIGNMENT
+function assignWorkerToRoom(roomId) {
+  if (roomWorkerMap.has(roomId)) {
+    return roomWorkerMap.get(roomId);
+  }
+
+  // ✅ Load balancing: Choose least loaded worker
+  let leastLoadedWorkerIndex = 0;
+  let minLoad = Infinity;
+
+  for (let i = 0; i < NUM_WORKERS; i++) {
+    const workerLoad = Array.from(rooms.values())
+      .filter(room => room.workerIndex === i)
+      .reduce((total, room) => total + room.getActualStudents().length, 0);
+    
+    if (workerLoad < minLoad) {
+      minLoad = workerLoad;
+      leastLoadedWorkerIndex = i;
+    }
+  }
+
+  roomWorkerMap.set(roomId, leastLoadedWorkerIndex);
+  console.log(`🎯 Room ${roomId} assigned to Worker ${leastLoadedWorkerIndex} (load: ${minLoad} students)`);
+  
+  return leastLoadedWorkerIndex;
+}
+
+// ✅ WORKER-SPECIFIC TRANSPORT CREATION
+const createWebRtcTransport = async (workerIndex = 0) => {
+  const router = mediasoupRouters[workerIndex];
+  const transport = await router.createWebRtcTransport(config.webRtcTransportOptions);
 
   const transportId = transport.id;
   const estimatedPorts = [];
   
-  const basePort = config.workerSettings.rtcMinPort + (Math.random() * 1000);
+  // ✅ Worker-specific port allocation
+  const workerPortBase = config.workerSettings.rtcMinPort + (workerIndex * 1000);
+  const basePort = workerPortBase + (Math.random() * 900); // Leave room for port range
   estimatedPorts.push(Math.floor(basePort), Math.floor(basePort) + 1);
   
   config.portMonitor.addTransportPorts(transportId, estimatedPorts);
@@ -369,47 +455,99 @@ const createWebRtcTransport = async () => {
   return transport;
 };
 
-// Routes
+// ✅ ENHANCED HEALTH ENDPOINT WITH WORKER STATS
 app.get('/api/health', (req, res) => {
   const portStats = config.portMonitor.getPortStats();
+  
+  // ✅ Calculate per-worker statistics
+  const workerStats = [];
+  for (let i = 0; i < NUM_WORKERS; i++) {
+    const workerRooms = Array.from(rooms.values()).filter(room => room.workerIndex === i);
+    const workerStudents = workerRooms.reduce((total, room) => total + room.getActualStudents().length, 0);
+    const workerProducers = workerRooms.reduce((total, room) => total + room.producers.size, 0);
+    
+    workerStats.push({
+      workerIndex: i,
+      activeRooms: workerRooms.length,
+      activeStudents: workerStudents,
+      totalProducers: workerProducers,
+      portRange: `${config.workerSettings.rtcMinPort + (i * 1000)}-${config.workerSettings.rtcMinPort + (i * 1000) + 999}`,
+      loadPercentage: Math.round((workerStudents / 75) * 100) // 75 students = 100% load per worker
+    });
+  }
+
+  const totalStudents = workerStats.reduce((sum, worker) => sum + worker.activeStudents, 0);
+  const averageLoad = Math.round(totalStudents / (NUM_WORKERS * 75) * 100);
+
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    activeRooms: rooms.size,
-    activePeers: peers.size,
-    server: 'MediaSoup SFU Server v2.5 - With Client Support',
+    server: `MediaSoup SFU Server v3.0 - Multi-Worker (${NUM_WORKERS} Workers)`,
+    
+    // ✅ Overall statistics
+    overview: {
+      totalWorkers: NUM_WORKERS,
+      activeRooms: rooms.size,
+      totalStudents: totalStudents,
+      activePeers: peers.size,
+      averageLoadPercentage: averageLoad,
+      recommendedMaxStudents: NUM_WORKERS * 75 // 75 per worker
+    },
+    
+    // ✅ Per-worker breakdown
+    workers: workerStats,
+    
+    // ✅ Room distribution
+    roomDistribution: Array.from(roomWorkerMap.entries()).map(([roomId, workerIndex]) => ({
+      roomId,
+      workerIndex,
+      students: rooms.has(roomId) ? rooms.get(roomId).getActualStudents().length : 0
+    })),
+    
     portStats: portStats,
     pagination: {
       studentsPerPage: 12,
-      description: 'Enhanced with Client viewing support alongside Proctor viewing'
+      description: 'Multi-Worker architecture with intelligent load balancing'
+    },
+    
+    // ✅ Performance recommendations
+    recommendations: {
+      status: averageLoad < 60 ? 'OPTIMAL' : averageLoad < 80 ? 'GOOD' : averageLoad < 95 ? 'HIGH_LOAD' : 'CRITICAL',
+      message: averageLoad < 60 ? 'System running optimally' :
+               averageLoad < 80 ? 'Good performance, monitor load' :
+               averageLoad < 95 ? 'High load detected, consider scaling' :
+               'Critical load - immediate action required'
     }
   });
 });
 
 app.get('/api/rtp-capabilities', (req, res) => {
   try {
+    // ✅ Return RTP capabilities from first worker (all workers have same capabilities)
     res.json({
       success: true,
-      rtpCapabilities: mediasoupRouter.rtpCapabilities
+      rtpCapabilities: mediasoupRouters[0].rtpCapabilities
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ✅ UPDATED: Setup transports with CLIENT support
+// ✅ UPDATED: Setup transports with WORKER SUPPORT
 app.post('/api/setup-transports', async (req, res) => {
   try {
     const { peerId, role, examId, userId, userName, clientId } = req.body;
     
     const roleDisplay = role === 'client' ? `Client ${clientId}` : role;
-    console.log(`🔧 Setting up transports for ${roleDisplay} ${userName} (${userId}) in exam ${examId}`);
-
+    
     if (!peers.has(peerId)) {
       throw new Error('Peer not found');
     }
 
     const peer = peers.get(peerId);
+    const workerIndex = peer.getWorkerIndex();
+    
+    console.log(`🔧 Setting up transports for ${roleDisplay} ${userName} (${userId}) in exam ${examId} [Worker ${workerIndex}]`);
     
     // Store additional metadata
     if (userId) peer.setUserId(userId);
@@ -421,6 +559,7 @@ app.post('/api/setup-transports', async (req, res) => {
 
     res.json({
       success: true,
+      workerIndex: workerIndex, // ✅ Include worker info in response
       transports: {
         send: {
           id: sendTransport.id,
@@ -442,7 +581,7 @@ app.post('/api/setup-transports', async (req, res) => {
   }
 });
 
-// ✅ UPDATED: Connect transports with CLIENT support
+// ✅ UPDATED: Connect transports with WORKER SUPPORT
 app.post('/api/connect-transports', async (req, res) => {
   try {
     const { 
@@ -456,12 +595,14 @@ app.post('/api/connect-transports', async (req, res) => {
     } = req.body;
     
     const peer = peers.get(peerId);
-    const roleDisplay = peer && peer.role === 'client' ? `Client ${clientId || peer.getClientId()}` : 'User';
-    console.log(`🔗 Connecting transports for ${roleDisplay} ${userName} (${userId}) in exam ${examId}`);
-
     if (!peer) {
       throw new Error('Peer not found');
     }
+
+    const roleDisplay = peer && peer.role === 'client' ? `Client ${clientId || peer.getClientId()}` : 'User';
+    const workerIndex = peer.getWorkerIndex();
+    
+    console.log(`🔗 Connecting transports for ${roleDisplay} ${userName} (${userId}) in exam ${examId} [Worker ${workerIndex}]`);
 
     if (sendDtlsParameters && peer.sendTransport) {
       await peer.sendTransport.connect({ dtlsParameters: sendDtlsParameters });
@@ -471,14 +612,18 @@ app.post('/api/connect-transports', async (req, res) => {
       await peer.recvTransport.connect({ dtlsParameters: recvDtlsParameters });
     }
 
-    res.json({ success: true, message: 'Transports connected successfully' });
+    res.json({ 
+      success: true, 
+      message: 'Transports connected successfully',
+      workerIndex: workerIndex
+    });
   } catch (error) {
     console.error('❌ Connect transports error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ✅ UPDATED: Produce with CLIENT notification support
+// ✅ UPDATED: Produce with WORKER SUPPORT
 app.post('/api/produce', async (req, res) => {
   try {
     const { 
@@ -492,8 +637,6 @@ app.post('/api/produce', async (req, res) => {
       clientId
     } = req.body;
     
-    console.log(`📹 Creating producer for ${userName} (${userId}) - ${streamType} in exam ${examId}`);
-    
     if (kind === 'audio') {
       return res.status(400).json({ 
         success: false, 
@@ -506,10 +649,13 @@ app.post('/api/produce', async (req, res) => {
     }
 
     const peer = peers.get(peerId);
+    const workerIndex = peer.getWorkerIndex();
 
     if (!peer.sendTransport) {
       throw new Error('Send transport not found for peer');
     }
+
+    console.log(`📹 Creating producer for ${userName} (${userId}) - ${streamType} in exam ${examId} [Worker ${workerIndex}]`);
 
     const producer = await peer.sendTransport.produce({ kind, rtpParameters });
     peer.addProducer(producer, streamType);
@@ -530,7 +676,8 @@ app.post('/api/produce', async (req, res) => {
           streamType: streamType,
           userId: userId,
           userName: userName,
-          examId: examId
+          examId: examId,
+          workerIndex: workerIndex // ✅ Include worker info
         });
       });
     }
@@ -542,14 +689,19 @@ app.post('/api/produce', async (req, res) => {
       }
     });
 
-    res.json({ success: true, producerId: producer.id, streamType: streamType });
+    res.json({ 
+      success: true, 
+      producerId: producer.id, 
+      streamType: streamType,
+      workerIndex: workerIndex
+    });
   } catch (error) {
     console.error('❌ Produce error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Keep existing batch consume endpoints unchanged
+// ✅ UPDATED: Batch consume with WORKER SUPPORT
 app.post('/api/batch-consume-paginated', async (req, res) => {
   try {
     const { peerId, producerIds, rtpCapabilities, page = 1 } = req.body;
@@ -559,6 +711,7 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
     }
 
     const peer = peers.get(peerId);
+    const workerIndex = peer.getWorkerIndex();
 
     if (!peer.recvTransport) {
       throw new Error('Recv transport not found for peer');
@@ -570,6 +723,7 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
     }
 
     const room = rooms.get(roomId);
+    const router = mediasoupRouters[workerIndex]; // ✅ Use correct worker's router
     const consumers = [];
 
     for (const producerId of producerIds) {
@@ -584,7 +738,7 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
         continue;
       }
 
-      if (!mediasoupRouter.canConsume({ producerId: producer.id, rtpCapabilities })) {
+      if (!router.canConsume({ producerId: producer.id, rtpCapabilities })) {
         continue;
       }
 
@@ -609,7 +763,8 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
         kind: consumer.kind,
         streamType: producerData.streamType,
         rtpParameters: consumer.rtpParameters,
-        userName: producerPeer ? producerPeer.getUserName() : producerData.peerId
+        userName: producerPeer ? producerPeer.getUserName() : producerData.peerId,
+        workerIndex: workerIndex // ✅ Include worker info
       });
     }
 
@@ -618,7 +773,8 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
       consumers: consumers,
       totalCreated: consumers.length,
       page: page,
-      message: `Page ${page} loaded with ${consumers.length} streams`
+      workerIndex: workerIndex,
+      message: `Page ${page} loaded with ${consumers.length} streams [Worker ${workerIndex}]`
     });
   } catch (error) {
     console.error('❌ Batch consume paginated error:', error);
@@ -626,6 +782,7 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
   }
 });
 
+// Keep other endpoints with similar worker support additions...
 app.post('/api/batch-consume', async (req, res) => {
   try {
     const { peerId, producerIds, rtpCapabilities } = req.body;
@@ -635,6 +792,7 @@ app.post('/api/batch-consume', async (req, res) => {
     }
 
     const peer = peers.get(peerId);
+    const workerIndex = peer.getWorkerIndex();
 
     if (!peer.recvTransport) {
       throw new Error('Recv transport not found for peer');
@@ -646,6 +804,7 @@ app.post('/api/batch-consume', async (req, res) => {
     }
 
     const room = rooms.get(roomId);
+    const router = mediasoupRouters[workerIndex];
     const consumers = [];
 
     for (const producerId of producerIds) {
@@ -660,7 +819,7 @@ app.post('/api/batch-consume', async (req, res) => {
         continue;
       }
 
-      if (!mediasoupRouter.canConsume({ producerId: producer.id, rtpCapabilities })) {
+      if (!router.canConsume({ producerId: producer.id, rtpCapabilities })) {
         continue;
       }
 
@@ -685,14 +844,16 @@ app.post('/api/batch-consume', async (req, res) => {
         kind: consumer.kind,
         streamType: producerData.streamType,
         rtpParameters: consumer.rtpParameters,
-        userName: producerPeer ? producerPeer.getUserName() : producerData.peerId
+        userName: producerPeer ? producerPeer.getUserName() : producerData.peerId,
+        workerIndex: workerIndex
       });
     }
 
     res.json({
       success: true,
       consumers: consumers,
-      totalCreated: consumers.length
+      totalCreated: consumers.length,
+      workerIndex: workerIndex
     });
   } catch (error) {
     console.error('❌ Batch consume error:', error);
@@ -709,6 +870,7 @@ app.post('/api/batch-resume-consumers', async (req, res) => {
     }
 
     const peer = peers.get(peerId);
+    const workerIndex = peer.getWorkerIndex();
     const resumedConsumers = [];
 
     for (const consumerId of consumerIds) {
@@ -724,7 +886,8 @@ app.post('/api/batch-resume-consumers', async (req, res) => {
     res.json({
       success: true,
       resumedConsumers: resumedConsumers,
-      totalResumed: resumedConsumers.length
+      totalResumed: resumedConsumers.length,
+      workerIndex: workerIndex
     });
   } catch (error) {
     console.error('❌ Batch resume consumers error:', error);
@@ -732,7 +895,7 @@ app.post('/api/batch-resume-consumers', async (req, res) => {
   }
 });
 
-// Keep existing API endpoints
+// Keep existing API endpoints with worker support
 app.get('/api/exam/:examId/producers/page/:page', (req, res) => {
   const { examId, page } = req.params;
   const roomId = `exam-${examId}`;
@@ -751,6 +914,7 @@ app.get('/api/exam/:examId/producers/page/:page', (req, res) => {
     page: pageNum,
     producers: paginatedData.producers,
     pagination: paginatedData.pagination,
+    workerIndex: room.workerIndex,
     totals: {
       camera: paginatedData.producers.camera.length,
       screen: paginatedData.producers.screen.length,
@@ -775,6 +939,7 @@ app.get('/api/exam/:examId/producers', (req, res) => {
     examId,
     producers: paginatedData.producers,
     pagination: paginatedData.pagination,
+    workerIndex: room.workerIndex,
     totals: {
       camera: paginatedData.producers.camera.length,
       screen: paginatedData.producers.screen.length,
@@ -783,7 +948,7 @@ app.get('/api/exam/:examId/producers', (req, res) => {
   });
 });
 
-// ✅ UPDATED: Stats endpoint with CLIENT support
+// ✅ UPDATED: Stats endpoint with MULTI-WORKER support
 app.get('/api/exam/:examId/stats', (req, res) => {
   const { examId } = req.params;
   const roomId = `exam-${examId}`;
@@ -797,7 +962,8 @@ app.get('/api/exam/:examId/stats', (req, res) => {
       connectedClients: 0,
       students: [],
       producers: 0,
-      consumers: 0
+      consumers: 0,
+      workerIndex: null
     });
   }
 
@@ -810,34 +976,40 @@ app.get('/api/exam/:examId/stats', (req, res) => {
     producerCount: peer.producers.size,
     consumerCount: peer.consumers.size,
     streamTypes: Array.from(peer.streamTypes).filter(type => type !== 'audio'),
-    connectionStatus: peer.connected ? 'connected' : 'disconnected'
+    connectionStatus: peer.connected ? 'connected' : 'disconnected',
+    workerIndex: peer.getWorkerIndex()
   }));
 
   const proctors = room.getProctors();
-  const clients = room.getClients(); // ✅ NEW
+  const clients = room.getClients();
   const summary = room.getActiveStudentsSummary();
 
   res.json({
     examId,
     roomId,
+    workerIndex: room.workerIndex,
     totalStudents: actualStudents.length,
     connectedProctors: proctors.length,
-    connectedClients: clients.length, // ✅ NEW
-    totalViewers: proctors.length + clients.length, // ✅ NEW
+    connectedClients: clients.length,
+    totalViewers: proctors.length + clients.length,
     students,
     totalProducers: room.producers.size,
     totalConsumers: actualStudents.reduce((sum, peer) => sum + peer.consumers.size, 0),
     streamTypes: ['camera', 'screen'],
     pagination: summary.pagination,
+    workerInfo: summary.workerInfo,
     lastUpdate: new Date().toISOString(),
     portStats: config.portMonitor.getPortStats()
   });
 });
 
-// ✅ UPDATED: Socket connection handler with CLIENT support
+// ✅ UPDATED: Socket connection handler with MULTI-WORKER support
 io.on('connection', (socket) => {
   socket.on('joinExam', ({ examId, role, userId, userName, clientId }) => {
     const roomId = `exam-${examId}`;
+    
+    // ✅ INTELLIGENT WORKER ASSIGNMENT
+    const workerIndex = assignWorkerToRoom(roomId);
     
     // ✅ UPDATED: Include clientId in peerId for clients
     const peerId = role === 'client' && clientId 
@@ -850,6 +1022,7 @@ io.on('connection', (socket) => {
       peer.setRole(role);
       peer.setUserId(userId);
       peer.setUserName(userName);
+      peer.setWorkerIndex(workerIndex); // ✅ Assign worker to peer
       
       // ✅ NEW: Set clientId for client role
       if (role === 'client' && clientId) {
@@ -858,8 +1031,9 @@ io.on('connection', (socket) => {
       
       peers.set(peerId, peer);
 
+      // ✅ Create room with worker assignment if it doesn't exist
       if (!rooms.has(roomId)) {
-        rooms.set(roomId, new Room(roomId));
+        rooms.set(roomId, new Room(roomId, workerIndex));
       }
       const room = rooms.get(roomId);
       room.addPeer(peer);
@@ -874,7 +1048,8 @@ io.on('connection', (socket) => {
         userId,
         userName,
         clientId: clientId || null,
-        message: `Successfully joined exam room as ${role}`
+        workerIndex: workerIndex, // ✅ Include worker info
+        message: `Successfully joined exam room as ${role} [Worker ${workerIndex}]`
       });
 
       // ✅ UPDATED: Handle CLIENT role like PROCTOR
@@ -882,12 +1057,15 @@ io.on('connection', (socket) => {
         const studentsSummary = room.getActiveStudentsSummary();
         const viewerType = role === 'client' ? `Client ${clientId}` : 'Proctor';
 
+        console.log(`👁️ ${viewerType} ${userName} joined exam ${examId} [Worker ${workerIndex}]`);
+
         // Method 1: Immediate check - FIXED PAGINATED (Page 1 only)
         const paginatedData = room.getPaginatedProducersData(1);
         if (paginatedData.producers.camera.length > 0 || paginatedData.producers.screen.length > 0) {
           socket.emit('batchProducers', {
             producers: paginatedData.producers,
             pagination: paginatedData.pagination,
+            workerIndex: workerIndex,
             totals: {
               camera: paginatedData.producers.camera.length,
               screen: paginatedData.producers.screen.length,
@@ -905,6 +1083,7 @@ io.on('connection', (socket) => {
             socket.emit('batchProducers', {
               producers: delayedPaginatedData.producers,
               pagination: delayedPaginatedData.pagination,
+              workerIndex: workerIndex,
               totals: {
                 camera: delayedPaginatedData.producers.camera.length,
                 screen: delayedPaginatedData.producers.screen.length,
@@ -915,7 +1094,8 @@ io.on('connection', (socket) => {
             socket.emit('forceProducerCheck', {
               examId,
               roomId,
-              message: 'Checking for existing students via API'
+              workerIndex,
+              message: `Checking for existing students via API [Worker ${workerIndex}]`
             });
           }
         }, 2000);
@@ -926,11 +1106,14 @@ io.on('connection', (socket) => {
           viewerName: userName,
           viewerType: role,
           clientId: clientId || null,
-          message: `${viewerType} ${userName} joined - please refresh your streams`
+          workerIndex: workerIndex,
+          message: `${viewerType} ${userName} joined - please refresh your streams [Worker ${workerIndex}]`
         });
       }
 
       if (role === 'student') {
+        console.log(`👨‍🎓 Student ${userName} joined exam ${examId} [Worker ${workerIndex}]`);
+        
         // ✅ UPDATED: Notify ALL VIEWERS (proctors + clients)
         const viewers = room.getViewers();
         
@@ -940,29 +1123,36 @@ io.on('connection', (socket) => {
             userId,
             userName,
             examId,
-            message: `Student ${userName} (ID: ${userId}) joined the exam`
+            workerIndex,
+            message: `Student ${userName} (ID: ${userId}) joined the exam [Worker ${workerIndex}]`
           });
         });
       }
 
     } catch (joinError) {
+      console.error(`❌ Join error [Worker ${workerIndex}]:`, joinError);
       socket.emit('joinError', {
         error: joinError.message,
         examId,
         role,
         userId,
         userName,
-        clientId: clientId || null
+        clientId: clientId || null,
+        workerIndex: workerIndex
       });
     }
 
-    // ✅ UPDATED: disconnect handler with CLIENT support
+    // ✅ UPDATED: disconnect handler with MULTI-WORKER support
     socket.on('disconnect', () => {
       try {
         if (peers.has(peerId)) {
           const peer = peers.get(peerId);
           const peerUserName = peer.getUserName();
           const peerClientId = peer.getClientId();
+          const peerWorkerIndex = peer.getWorkerIndex();
+          
+          console.log(`👋 Peer ${peerUserName} disconnected [Worker ${peerWorkerIndex}]`);
+          
           peer.close();
           peers.delete(peerId);
 
@@ -975,19 +1165,58 @@ io.on('connection', (socket) => {
               role, 
               userId,
               userName: peerUserName,
-              clientId: peerClientId
+              clientId: peerClientId,
+              workerIndex: peerWorkerIndex
             });
             
             const actualStudents = room.getActualStudents();
+            console.log(`📊 Room ${roomId} [Worker ${peerWorkerIndex}]: ${actualStudents.length} students remaining`);
           }
         }
       } catch (disconnectError) {
-        // Silent error handling
+        console.error('❌ Disconnect error:', disconnectError);
       }
     });
   });
 
-  // Keep existing socket handlers unchanged
+  // ✅ ADD THIS TO SOCKET HANDLERS IN BACKEND
+socket.on('requestPageStreams', ({ examId, peerId, page, studentIds }) => {
+  const roomId = `exam-${examId}`;
+  
+  try {
+    if (rooms.has(roomId)) {
+      const room = rooms.get(roomId);
+      const streams = [];
+      
+      // ✅ Get streams only for requested students
+      for (const [producerId, data] of room.producers) {
+        if (studentIds.includes(data.peerId)) {
+          const peer = room.peers.get(data.peerId);
+          streams.push({
+            producerId,
+            peerId: data.peerId,
+            kind: data.producer.kind,
+            streamType: data.streamType,
+            userName: peer ? peer.getUserName() : data.peerId
+          });
+        }
+      }
+      
+      socket.emit('pageStreamsData', {
+        page: page,
+        streams: streams,
+        examId: examId
+      });
+      
+      console.log(`📄 Sent ${streams.length} streams for page ${page} to ${peerId}`);
+    }
+  } catch (error) {
+    console.error(`❌ Page streams request error:`, error);
+  }
+});
+
+
+  // Keep existing socket handlers with worker support
   socket.on('refreshProducers', ({ examId, peerId, page = 1 }) => {
     const roomId = `exam-${examId}`;
 
@@ -1000,6 +1229,7 @@ io.on('connection', (socket) => {
         socket.emit('batchProducers', {
           producers: paginatedData.producers,
           pagination: paginatedData.pagination,
+          workerIndex: room.workerIndex,
           totals: {
             camera: paginatedData.producers.camera.length,
             screen: paginatedData.producers.screen.length,
@@ -1025,6 +1255,7 @@ io.on('connection', (socket) => {
         socket.emit('pageChanged', {
           producers: paginatedData.producers,
           pagination: paginatedData.pagination,
+          workerIndex: room.workerIndex,
           totals: {
             camera: paginatedData.producers.camera.length,
             screen: paginatedData.producers.screen.length,
@@ -1040,18 +1271,21 @@ io.on('connection', (socket) => {
   });
 
   socket.on('error', (error) => {
-    // Silent error handling
+    console.error('Socket error:', error);
   });
 });
 
 const startServer = async () => {
   try {
-    await initializeMediasoup()
+    // ✅ Initialize all workers before starting server
+    await initializeMediasoup();
     
     const PORT = process.env.PORT || 5000;
     server.listen(PORT, () => {
-      console.log(`🚀 MediaSoup SFU Server v2.5 with CLIENT support running on port ${PORT}`);
-      config.portMonitor.logPortUsage('Server started with Client + Proctor viewing support');
+      console.log(`🚀 MediaSoup SFU Server v3.0 with ${NUM_WORKERS}-Worker support running on port ${PORT}`);
+      console.log(`📊 Server capacity: ~${NUM_WORKERS * 75} concurrent students`);
+      console.log(`🎯 Load balancing: Intelligent room-to-worker assignment`);
+      config.portMonitor.logPortUsage(`Multi-Worker server started with ${NUM_WORKERS} workers`);
     });
   } catch (error) {
     console.error('❌ Server startup error:', error);
@@ -1064,25 +1298,31 @@ process.on('SIGINT', gracefulShutdown);
 
 function gracefulShutdown() {
   console.log('🛑 Graceful shutdown initiated...');
+  
+  // ✅ Close all peers
   for (const peer of peers.values()) {
     peer.close();
   }
   peers.clear();
   rooms.clear();
 
-  if (mediasoupWorker) {
-    mediasoupWorker.close();
+  // ✅ Close all workers
+  for (let i = 0; i < mediasoupWorkers.length; i++) {
+    if (mediasoupWorkers[i]) {
+      console.log(`🛑 Closing worker ${i}...`);
+      mediasoupWorkers[i].close();
+    }
   }
 
   server.close(() => {
-    console.log('✅ Server closed gracefully');
+    console.log('✅ Multi-Worker server closed gracefully');
     process.exit(0);
   });
 
   setTimeout(() => {
     console.log('❌ Force shutdown after timeout');
     process.exit(1);
-  }, 10000);
+  }, 15000); // Increased timeout for multiple workers
 }
 
 startServer().catch(console.error);
