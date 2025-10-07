@@ -7,6 +7,7 @@ const socketIo = require('socket.io');
 const mediasoup = require('mediasoup');
 const os = require('os'); // ✅ Added for CPU detection
 const config = require('./mediasoup-config');
+const { getAssignedStudents } = require('./learner');
 
 const app = express();
 const server = http.createServer(app);
@@ -54,15 +55,19 @@ let nextWorkerIndex = 0; // Round-robin worker assignment
 const rooms = new Map();
 const peers = new Map();
 
-// ✅ ENHANCED Room class with WORKER ASSIGNMENT
+// ✅ ENHANCED Room class with STRICT PAGINATION FIXES
 class Room {
-  constructor(roomId, workerIndex = 0) {
-    this.id = roomId;
-    this.workerIndex = workerIndex; // ✅ NEW: Track which worker handles this room
-    this.peers = new Map();
-    this.producers = new Map();
-    this.STUDENTS_PER_PAGE = 12;
-  }
+constructor(examId, workerIndex = 0) {
+  this.examId = examId;
+  this.workerIndex = workerIndex;
+  this.STUDENTS_PER_PAGE = 12; // ✅ CHANGE: 12 students per page
+  this.peers = new Map();
+  this.producers = new Map();
+  this.consumers = new Map();
+  this.router = null;
+  this.lastActivity = Date.now();
+}
+
 
   // ✅ NEW: Get the assigned worker and router for this room
   getAssignedWorker() {
@@ -116,6 +121,30 @@ class Room {
     return actualStudents;
   }
 
+  // ✅ FIXED: Student position tracking
+  getStudentPagePosition(peerId) {
+    const actualStudents = this.getActualStudents();
+    const studentIndex = actualStudents.findIndex(student => student.id === peerId);
+    
+    if (studentIndex === -1) return null;
+    
+    const pageNumber = Math.floor(studentIndex / this.STUDENTS_PER_PAGE) + 1;
+    const positionInPage = (studentIndex % this.STUDENTS_PER_PAGE) + 1;
+    
+    return {
+      studentIndex: studentIndex + 1,
+      pageNumber,
+      positionInPage,
+      belongsToPage: (pageNum) => pageNumber === pageNum
+    };
+  }
+
+  // ✅ FIXED: Check if student belongs to specific page
+  isStudentInPage(peerId, page) {
+    const position = this.getStudentPagePosition(peerId);
+    return position ? position.belongsToPage(page) : false;
+  }
+
   addProducer(producer, peerId, streamType) {
     this.producers.set(producer.id, { producer, peerId, streamType });
     const peer = this.peers.get(peerId);
@@ -136,7 +165,7 @@ class Room {
     return peer ? peer.getUserName() : peerId;
   }
 
-  // ✅ Paginated data with userName support
+  // ✅ FIXED: STRICT Paginated data with EXACT limits
   getPaginatedProducersData(page = 1) {
     const actualStudents = this.getActualStudents();
     const totalActualStudents = actualStudents.length;
@@ -158,14 +187,37 @@ class Room {
     }
 
     const totalPages = Math.ceil(totalActualStudents / this.STUDENTS_PER_PAGE);
+    
+    // ✅ STRICT: Page validation
+    if (page < 1 || page > totalPages) {
+      return {
+        producers: { camera: [], screen: [] },
+        pagination: {
+          currentPage: Math.min(Math.max(page, 1), totalPages),
+          totalPages,
+          totalStudents: totalActualStudents,
+          studentsPerPage: this.STUDENTS_PER_PAGE,
+          currentPageStudents: 0,
+          hasNextPage: false,
+          hasPreviousPage: false,
+          workerIndex: this.workerIndex
+        }
+      };
+    }
+
     const startIndex = (page - 1) * this.STUDENTS_PER_PAGE;
     const endIndex = startIndex + this.STUDENTS_PER_PAGE;
     
+    // ✅ STRICT: Only exact page students
     const currentPageStudents = actualStudents.slice(startIndex, endIndex);
-    const currentPageStudentIds = currentPageStudents.map(student => student.id);
+    
+    // ✅ CRITICAL: Enforce maximum limit per page
+    const strictPageStudents = currentPageStudents.slice(0, this.STUDENTS_PER_PAGE);
+    const currentPageStudentIds = strictPageStudents.map(student => student.id);
 
     const paginatedProducers = { camera: [], screen: [] };
-    
+
+    // ✅ STRICT: Only include producers for EXACT page students
     for (const [producerId, data] of this.producers) {
       if (currentPageStudentIds.includes(data.peerId)) {
         const peer = this.peers.get(data.peerId);
@@ -175,7 +227,7 @@ class Room {
           kind: data.producer.kind,
           userName: peer ? peer.getUserName() : data.peerId
         };
-        
+
         if (data.streamType === 'camera') {
           paginatedProducers.camera.push(producerInfo);
         } else if (data.streamType === 'screen') {
@@ -191,7 +243,7 @@ class Room {
         totalPages,
         totalStudents: totalActualStudents,
         studentsPerPage: this.STUDENTS_PER_PAGE,
-        currentPageStudents: currentPageStudents.length,
+        currentPageStudents: strictPageStudents.length,
         hasNextPage: page < totalPages,
         hasPreviousPage: page > 1,
         workerIndex: this.workerIndex // ✅ Include worker info
@@ -257,7 +309,7 @@ class Room {
   }
 }
 
-// ✅ UPDATED Peer class with WORKER SUPPORT
+// ✅ UPDATED Peer class with WORKER SUPPORT + Page Tracking
 class Peer {
   constructor(id, socket) {
     this.id = id;
@@ -274,6 +326,7 @@ class Peer {
     this.userName = null;
     this.clientId = null;
     this.connected = true;
+    this.currentPage = 1; // ✅ NEW: Track viewer's current page
     
     if (socket) {
       socket.on('disconnect', () => {
@@ -296,6 +349,10 @@ class Peer {
   // ✅ NEW: Client ID methods
   setClientId(clientId) { this.clientId = clientId; }
   getClientId() { return this.clientId; }
+
+  // ✅ NEW: Page tracking methods
+  setCurrentPage(page) { this.currentPage = page; }
+  getCurrentPage() { return this.currentPage; }
 
   // ✅ NEW: Check if peer is a viewer (proctor or client)
   isViewer() {
@@ -506,7 +563,7 @@ app.get('/api/health', (req, res) => {
     
     portStats: portStats,
     pagination: {
-      studentsPerPage: 12,
+      studentsPerPage: 1,
       description: 'Multi-Worker architecture with intelligent load balancing'
     },
     
@@ -548,7 +605,9 @@ app.post('/api/setup-transports', async (req, res) => {
     const workerIndex = peer.getWorkerIndex();
     
     console.log(`🔧 Setting up transports for ${roleDisplay} ${userName} (${userId}) in exam ${examId} [Worker ${workerIndex}]`);
-    
+          // Proctor ka Data User 
+const user =  await getAssignedStudents(userId, examId)
+console.log("user123" ,user)
     // Store additional metadata
     if (userId) peer.setUserId(userId);
     if (userName) peer.setUserName(userName);
@@ -669,16 +728,24 @@ app.post('/api/produce', async (req, res) => {
       const viewers = room.getViewers();
       
       viewers.forEach(viewer => {
-        viewer.socket.emit('newProducer', {
-          producerId: producer.id,
-          peerId: peerId,
-          kind: kind,
-          streamType: streamType,
-          userId: userId,
-          userName: userName,
-          examId: examId,
-          workerIndex: workerIndex // ✅ Include worker info
-        });
+        // ✅ FIXED: Only notify if student belongs to viewer's current page
+        const viewerCurrentPage = viewer.getCurrentPage() || 1;
+        const studentPosition = room.getStudentPagePosition(peerId);
+        
+        if (studentPosition && studentPosition.belongsToPage(viewerCurrentPage)) {
+          viewer.socket.emit('newProducer', {
+            producerId: producer.id,
+            peerId: peerId,
+            kind: kind,
+            streamType: streamType,
+            userId: userId,
+            userName: userName,
+            examId: examId,
+            workerIndex: workerIndex, // ✅ Include worker info
+            studentPosition: studentPosition,
+            shouldRefresh: true
+          });
+        }
       });
     }
 
@@ -726,7 +793,16 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
     const router = mediasoupRouters[workerIndex]; // ✅ Use correct worker's router
     const consumers = [];
 
+    // ✅ STRICT: Limit to max page size
+    const maxConsumersPerPage = room.STUDENTS_PER_PAGE * 2; // 12 students × 2 streams = 24 max
+    let consumersCreated = 0;
+
     for (const producerId of producerIds) {
+      if (consumersCreated >= maxConsumersPerPage) {
+        console.log(`⚠️ Page ${page} reached max consumers limit (${maxConsumersPerPage})`);
+        break;
+      }
+
       const producerData = room.producers.get(producerId);
       if (!producerData) {
         continue;
@@ -764,8 +840,11 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
         streamType: producerData.streamType,
         rtpParameters: consumer.rtpParameters,
         userName: producerPeer ? producerPeer.getUserName() : producerData.peerId,
+        userId: producerPeer ? producerPeer.getUserId() : producerData.peerId,
         workerIndex: workerIndex // ✅ Include worker info
       });
+
+      consumersCreated++;
     }
 
     res.json({
@@ -773,14 +852,16 @@ app.post('/api/batch-consume-paginated', async (req, res) => {
       consumers: consumers,
       totalCreated: consumers.length,
       page: page,
+      maxPerPage: maxConsumersPerPage,
       workerIndex: workerIndex,
-      message: `Page ${page} loaded with ${consumers.length} streams [Worker ${workerIndex}]`
+      message: `Page ${page} loaded with ${consumers.length}/${maxConsumersPerPage} streams [Worker ${workerIndex}]`
     });
   } catch (error) {
     console.error('❌ Batch consume paginated error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
 
 // Keep other endpoints with similar worker support additions...
 app.post('/api/batch-consume', async (req, res) => {
@@ -830,6 +911,7 @@ app.post('/api/batch-consume', async (req, res) => {
       });
 
       peer.addConsumer(consumer);
+
 
       consumer.on('close', () => {
         peer.removeConsumer(consumer.id);
@@ -1003,272 +1085,383 @@ app.get('/api/exam/:examId/stats', (req, res) => {
   });
 });
 
-// ✅ UPDATED: Socket connection handler with MULTI-WORKER support
+// ✅ UPDATED: Socket connection handler with STRICT PAGINATION
 io.on('connection', (socket) => {
-  socket.on('joinExam', ({ examId, role, userId, userName, clientId }) => {
-    const roomId = `exam-${examId}`;
-    
-    // ✅ INTELLIGENT WORKER ASSIGNMENT
-    const workerIndex = assignWorkerToRoom(roomId);
-    
-    // ✅ UPDATED: Include clientId in peerId for clients
-    const peerId = role === 'client' && clientId 
-      ? `${clientId}-${userId}-${socket.id}` 
-      : `${userId}-${socket.id}`;
-
-    try {
-      const peer = new Peer(peerId, socket);
-      peer.setRoom(roomId);
-      peer.setRole(role);
-      peer.setUserId(userId);
-      peer.setUserName(userName);
-      peer.setWorkerIndex(workerIndex); // ✅ Assign worker to peer
-      
-      // ✅ NEW: Set clientId for client role
-      if (role === 'client' && clientId) {
-        peer.setClientId(clientId);
-      }
-      
-      peers.set(peerId, peer);
-
-      // ✅ Create room with worker assignment if it doesn't exist
-      if (!rooms.has(roomId)) {
-        rooms.set(roomId, new Room(roomId, workerIndex));
-      }
-      const room = rooms.get(roomId);
-      room.addPeer(peer);
-
-      socket.join(roomId);
-
-      socket.emit('joinedExam', {
-        examId,
-        roomId,
-        peerId,
-        role,
-        userId,
-        userName,
-        clientId: clientId || null,
-        workerIndex: workerIndex, // ✅ Include worker info
-        message: `Successfully joined exam room as ${role} [Worker ${workerIndex}]`
-      });
-
-      // ✅ UPDATED: Handle CLIENT role like PROCTOR
-      if (role === 'proctor' || role === 'client') {
-        const studentsSummary = room.getActiveStudentsSummary();
-        const viewerType = role === 'client' ? `Client ${clientId}` : 'Proctor';
-
-        console.log(`👁️ ${viewerType} ${userName} joined exam ${examId} [Worker ${workerIndex}]`);
-
-        // Method 1: Immediate check - FIXED PAGINATED (Page 1 only)
-        const paginatedData = room.getPaginatedProducersData(1);
-        if (paginatedData.producers.camera.length > 0 || paginatedData.producers.screen.length > 0) {
-          socket.emit('batchProducers', {
-            producers: paginatedData.producers,
-            pagination: paginatedData.pagination,
-            workerIndex: workerIndex,
-            totals: {
-              camera: paginatedData.producers.camera.length,
-              screen: paginatedData.producers.screen.length,
-              total: paginatedData.producers.camera.length + paginatedData.producers.screen.length
-            }
-          });
-        }
-
-        // Method 2: Delayed comprehensive check - FIXED PAGINATED
-        setTimeout(() => {
-          const delayedPaginatedData = room.getPaginatedProducersData(1);
-          const delayedSummary = room.getActiveStudentsSummary();
-          
-          if (delayedPaginatedData.producers.camera.length > 0 || delayedPaginatedData.producers.screen.length > 0) {
-            socket.emit('batchProducers', {
-              producers: delayedPaginatedData.producers,
-              pagination: delayedPaginatedData.pagination,
-              workerIndex: workerIndex,
-              totals: {
-                camera: delayedPaginatedData.producers.camera.length,
-                screen: delayedPaginatedData.producers.screen.length,
-                total: delayedPaginatedData.producers.camera.length + delayedPaginatedData.producers.screen.length
-              }
-            });
-          } else {
-            socket.emit('forceProducerCheck', {
-              examId,
-              roomId,
-              workerIndex,
-              message: `Checking for existing students via API [Worker ${workerIndex}]`
-            });
-          }
-        }, 2000);
-
-        // ✅ UPDATED: Notify students about new viewer
-        socket.to(roomId).emit('viewerJoined', {
-          viewerId: peerId,
-          viewerName: userName,
-          viewerType: role,
-          clientId: clientId || null,
-          workerIndex: workerIndex,
-          message: `${viewerType} ${userName} joined - please refresh your streams [Worker ${workerIndex}]`
-        });
-      }
-
-      if (role === 'student') {
-        console.log(`👨‍🎓 Student ${userName} joined exam ${examId} [Worker ${workerIndex}]`);
-        
-        // ✅ UPDATED: Notify ALL VIEWERS (proctors + clients)
-        const viewers = room.getViewers();
-        
-        viewers.forEach(viewer => {
-          viewer.socket.emit('studentJoined', {
-            peerId,
-            userId,
-            userName,
-            examId,
-            workerIndex,
-            message: `Student ${userName} (ID: ${userId}) joined the exam [Worker ${workerIndex}]`
-          });
-        });
-      }
-
-    } catch (joinError) {
-      console.error(`❌ Join error [Worker ${workerIndex}]:`, joinError);
-      socket.emit('joinError', {
-        error: joinError.message,
-        examId,
-        role,
-        userId,
-        userName,
-        clientId: clientId || null,
-        workerIndex: workerIndex
-      });
-    }
-
-    // ✅ UPDATED: disconnect handler with MULTI-WORKER support
-    socket.on('disconnect', () => {
-      try {
-        if (peers.has(peerId)) {
-          const peer = peers.get(peerId);
-          const peerUserName = peer.getUserName();
-          const peerClientId = peer.getClientId();
-          const peerWorkerIndex = peer.getWorkerIndex();
-          
-          console.log(`👋 Peer ${peerUserName} disconnected [Worker ${peerWorkerIndex}]`);
-          
-          peer.close();
-          peers.delete(peerId);
-
-          if (rooms.has(roomId)) {
-            const room = rooms.get(roomId);
-            room.removePeer(peerId);
-            
-            socket.to(roomId).emit('peerLeft', { 
-              peerId, 
-              role, 
-              userId,
-              userName: peerUserName,
-              clientId: peerClientId,
-              workerIndex: peerWorkerIndex
-            });
-            
-            const actualStudents = room.getActualStudents();
-            console.log(`📊 Room ${roomId} [Worker ${peerWorkerIndex}]: ${actualStudents.length} students remaining`);
-          }
-        }
-      } catch (disconnectError) {
-        console.error('❌ Disconnect error:', disconnectError);
-      }
-    });
-  });
-
-  // ✅ ADD THIS TO SOCKET HANDLERS IN BACKEND
-socket.on('requestPageStreams', ({ examId, peerId, page, studentIds }) => {
+socket.on('joinExam', ({ examId, role, userId, userName, clientId }) => {
   const roomId = `exam-${examId}`;
   
-  try {
-    if (rooms.has(roomId)) {
-      const room = rooms.get(roomId);
-      const streams = [];
-      
-      // ✅ Get streams only for requested students
-      for (const [producerId, data] of room.producers) {
-        if (studentIds.includes(data.peerId)) {
-          const peer = room.peers.get(data.peerId);
-          streams.push({
-            producerId,
-            peerId: data.peerId,
-            kind: data.producer.kind,
-            streamType: data.streamType,
-            userName: peer ? peer.getUserName() : data.peerId
-          });
-        }
-      }
-      
-      socket.emit('pageStreamsData', {
-        page: page,
-        streams: streams,
-        examId: examId
-      });
-      
-      console.log(`📄 Sent ${streams.length} streams for page ${page} to ${peerId}`);
-    }
-  } catch (error) {
-    console.error(`❌ Page streams request error:`, error);
-  }
-});
-
-
-  // Keep existing socket handlers with worker support
-  socket.on('refreshProducers', ({ examId, peerId, page = 1 }) => {
-    const roomId = `exam-${examId}`;
+  // ✅ INTELLIGENT WORKER ASSIGNMENT
+  const workerIndex = assignWorkerToRoom(roomId);
+  
+  // ✅ UPDATED: Include clientId in peerId for clients
+  const peerId = role === 'client' && clientId 
+    ? `${clientId}-${userId}-${socket.id}` 
+    : `${userId}-${socket.id}`;
 
     try {
-      if (rooms.has(roomId)) {
-        const room = rooms.get(roomId);
-        const paginatedData = room.getPaginatedProducersData(page);
-        const summary = room.getActiveStudentsSummary();
+    const peer = new Peer(peerId, socket);
+    peer.setRoom(roomId);
+    peer.setRole(role);
+    peer.setUserId(userId);
+    peer.setUserName(userName);
+    peer.setWorkerIndex(workerIndex);
+    
+    // ✅ NEW: Set clientId for client role
+    if (role === 'client' && clientId) {
+      peer.setClientId(clientId);
+    }
+    
+    peers.set(peerId, peer);
 
+    // ✅ Create room with worker assignment if it doesn't exist
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, new Room(roomId, workerIndex));
+    }
+    const room = rooms.get(roomId);
+    room.addPeer(peer);
+
+    socket.join(roomId);
+
+    socket.emit('joinedExam', {
+      examId,
+      roomId,
+      peerId,
+      role,
+      userId,
+      userName,
+      clientId: clientId || null,
+      workerIndex: workerIndex,
+      message: `Successfully joined exam room as ${role} [Worker ${workerIndex}]`
+    });
+
+    // ✅ UPDATED: Handle CLIENT role like PROCTOR
+    if (role === 'proctor' || role === 'client') {
+      const studentsSummary = room.getActiveStudentsSummary();
+      const viewerType = role === 'client' ? `Client ${clientId}` : 'Proctor';
+
+      console.log(`👁️ ${viewerType} ${userName} joined exam ${examId} [Worker ${workerIndex}]`);
+
+      // Method 1: Immediate check - FIXED PAGINATED (Page 1 only)
+      const paginatedData = room.getPaginatedProducersData(1);
+      if (paginatedData.producers.camera.length > 0 || paginatedData.producers.screen.length > 0) {
         socket.emit('batchProducers', {
           producers: paginatedData.producers,
           pagination: paginatedData.pagination,
-          workerIndex: room.workerIndex,
+          workerIndex: workerIndex,
           totals: {
             camera: paginatedData.producers.camera.length,
             screen: paginatedData.producers.screen.length,
             total: paginatedData.producers.camera.length + paginatedData.producers.screen.length
           }
         });
-      } else {
-        socket.emit('refreshError', { error: 'Room not found', examId });
       }
-    } catch (refreshError) {
-      socket.emit('refreshError', { error: refreshError.message, examId });
+
+      // Method 2: Delayed comprehensive check - FIXED PAGINATED
+      setTimeout(() => {
+        const delayedPaginatedData = room.getPaginatedProducersData(1);
+        
+        if (delayedPaginatedData.producers.camera.length > 0 || delayedPaginatedData.producers.screen.length > 0) {
+          socket.emit('batchProducers', {
+            producers: delayedPaginatedData.producers,
+            pagination: delayedPaginatedData.pagination,
+            workerIndex: workerIndex,
+            totals: {
+              camera: delayedPaginatedData.producers.camera.length,
+              screen: delayedPaginatedData.producers.screen.length,
+              total: delayedPaginatedData.producers.camera.length + delayedPaginatedData.producers.screen.length
+            }
+          });
+        }
+      }, 2000);
+    }
+
+ // ✅ CRITICAL FIX: Student join with smart auto-refresh logic
+if (role === 'student') {
+  console.log(`👨‍🎓 Student ${userName} joined exam ${examId} [Worker ${workerIndex}]`);
+  
+  // ✅ CRITICAL: Always send complete student info to ALL viewers
+  const viewers = room.getViewers();
+  const actualStudentsCount = room.getActualStudents().length;
+  const allStudentsInfo = room.getActualStudents().map(student => ({
+    peerId: student.id,
+    userId: student.getUserId(),
+    userName: student.getUserName(),
+    role: student.role,
+    isOnline: true
+  }));
+  
+  viewers.forEach(viewer => {
+    const viewerCurrentPage = viewer.getCurrentPage() || 1;
+    const studentPosition = room.getStudentPagePosition(peerId);
+    
+    // ✅ CRITICAL: Calculate current page capacity
+    const currentPageStartIndex = (viewerCurrentPage - 1) * room.STUDENTS_PER_PAGE;
+    const currentPageEndIndex = currentPageStartIndex + room.STUDENTS_PER_PAGE;
+    const studentsOnCurrentPage = room.getActualStudents()
+      .slice(currentPageStartIndex, currentPageEndIndex).length;
+    const currentPageFull = studentsOnCurrentPage >= room.STUDENTS_PER_PAGE;
+    
+    console.log(`📄 Page Status Check:`, {
+      viewerCurrentPage,
+      studentPosition: studentPosition?.pageNumber,
+      studentsOnCurrentPage,
+      maxPerPage: room.STUDENTS_PER_PAGE,
+      currentPageFull,
+      shouldAutoRefresh: studentPosition && studentPosition.belongsToPage(viewerCurrentPage) && !currentPageFull
+    });
+    
+    // ✅ ALWAYS send complete pagination update
+    viewer.socket.emit('completeStudentsUpdate', {
+      totalStudents: actualStudentsCount,
+      allStudents: allStudentsInfo,
+      newStudent: {
+        peerId,
+        userId,
+        userName,
+        examId,
+        workerIndex,
+        studentPosition: studentPosition,
+        isOnCurrentPage: studentPosition ? studentPosition.belongsToPage(viewerCurrentPage) : false
+      }
+    });
+    
+    // ✅ CRITICAL: Auto-refresh logic based on page capacity
+    if (studentPosition && studentPosition.belongsToPage(viewerCurrentPage) && !currentPageFull) {
+      // Student belongs to current page AND page has space (< 12)
+      console.log(`🔄 AUTO-REFRESH: Student ${userName} joins page ${viewerCurrentPage} (${studentsOnCurrentPage}/12)`);
+      viewer.socket.emit('studentJoined', {
+        peerId,
+        userId,
+        userName,
+        examId,
+        workerIndex,
+        studentPosition: studentPosition,
+        shouldRefresh: true, // ✅ CRITICAL: Trigger auto-refresh
+        refreshReason: 'page_has_space',
+        totalStudents: actualStudentsCount,
+        currentPageStudents: studentsOnCurrentPage,
+        maxPageStudents: room.STUDENTS_PER_PAGE,
+        message: `Student ${userName} joined page ${viewerCurrentPage} - auto-refreshing`
+      });
+    } else if (studentPosition && studentPosition.belongsToPage(viewerCurrentPage) && currentPageFull) {
+      // Student belongs to current page BUT page is full (= 12)
+      console.log(`✋ NO REFRESH: Page ${viewerCurrentPage} is FULL (${studentsOnCurrentPage}/12)`);
+      viewer.socket.emit('studentJoined', {
+        peerId,
+        userId,
+        userName,
+        examId,
+        workerIndex,
+        studentPosition: studentPosition,
+        shouldRefresh: false, // ✅ CRITICAL: NO auto-refresh
+        refreshReason: 'page_full',
+        totalStudents: actualStudentsCount,
+        currentPageStudents: studentsOnCurrentPage,
+        maxPageStudents: room.STUDENTS_PER_PAGE,
+        message: `Student ${userName} joined page ${viewerCurrentPage} - page is full, use Next button`
+      });
+    } else {
+      // Student belongs to different page
+      const targetPage = studentPosition ? studentPosition.pageNumber : 'Unknown';
+      console.log(`📊 SILENT UPDATE: Student ${userName} joined page ${targetPage}, viewer on page ${viewerCurrentPage}`);
+      viewer.socket.emit('studentCountUpdated', {
+        totalStudents: actualStudentsCount,
+        newStudentPage: targetPage,
+        newStudentName: userName,
+        newStudentId: userId,
+        viewerCurrentPage: viewerCurrentPage,
+        message: `Student ${userName} joined page ${targetPage} - pagination updated`
+      });
     }
   });
+}
 
-  socket.on('changePage', ({ examId, peerId, page }) => {
+  } catch (joinError) {
+    console.error(`❌ Join error [Worker ${workerIndex}]:`, joinError);
+    socket.emit('joinError', {
+      error: joinError.message,
+      examId,
+      role,
+      userId,
+      userName,
+      clientId: clientId || null,
+      workerIndex: workerIndex
+    });
+  }
+
+    // ✅ UPDATED: disconnect handler with MULTI-WORKER support
+  // ✅ FIXED: Disconnect handler without undefined variables
+socket.on('disconnect', () => {
+  try {
+    if (peers.has(peerId)) {
+      const peer = peers.get(peerId);
+      const peerUserName = peer ? peer.getUserName() : 'Unknown';
+      const peerClientId = peer ? peer.getClientId() : null;
+      const peerWorkerIndex = peer ? peer.getWorkerIndex() : 0;
+      
+      console.log(`👋 Peer ${peerUserName} disconnected [Worker ${peerWorkerIndex}]`);
+      
+      if (peer) {
+        peer.close();
+      }
+      peers.delete(peerId);
+
+      if (rooms.has(roomId)) {
+        const room = rooms.get(roomId);
+        room.removePeer(peerId);
+        
+        // ✅ CRITICAL: Notify all viewers about peer leaving
+        const viewers = room.getViewers();
+        viewers.forEach(viewer => {
+          viewer.socket.emit('peerLeft', { 
+            peerId, 
+            role, 
+            userId,
+            userName: peerUserName,
+            clientId: peerClientId,
+            workerIndex: peerWorkerIndex
+          });
+        });
+        
+        const actualStudents = room.getActualStudents();
+        console.log(`📊 Room ${roomId} [Worker ${peerWorkerIndex}]: ${actualStudents.length} students remaining`);
+      }
+    }
+  } catch (disconnectError) {
+    console.error('❌ Disconnect error:', disconnectError.message);
+  }
+});
+
+  });
+
+// ✅ FIXED: changePage handler
+socket.on('changePage', ({ examId, peerId, page }) => {
+  try {
     const roomId = `exam-${examId}`;
+    const room = rooms.get(roomId);
+    
+    if (!room) {
+      socket.emit('error', { message: 'Room not found' });
+      return;
+    }
 
+    console.log(`📄 Page change request: ${peerId} requesting page ${page}`);
+    
+    // ✅ CRITICAL: Update peer's current page
+    const peer = peers.get(peerId);
+    if (peer) {
+      peer.setCurrentPage(page);
+      console.log(`✅ Updated ${peerId} to page ${page}`);
+    }
+    
+    // ✅ Get paginated data for the requested page
+    const paginatedData = room.getPaginatedProducersData(page);
+    
+    console.log(`📊 Page ${page} data:`, {
+      totalStudents: paginatedData.pagination.totalStudents,
+      currentPageStudents: paginatedData.pagination.currentPageStudents,
+      cameraProducers: paginatedData.producers.camera.length,
+      screenProducers: paginatedData.producers.screen.length
+    });
+    
+    // ✅ Send response with correct page info
+    socket.emit('pageChanged', {
+      examId,
+      peerId,
+      producers: paginatedData.producers,
+      pagination: paginatedData.pagination,
+      workerIndex: room.workerIndex,
+      totals: {
+        camera: paginatedData.producers.camera.length,
+        screen: paginatedData.producers.screen.length,
+        total: paginatedData.producers.camera.length + paginatedData.producers.screen.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Change page error:', error.message);
+    socket.emit('error', { message: error.message });
+  }
+});
+
+  // ✅ ADD THIS TO SOCKET HANDLERS IN BACKEND
+  socket.on('requestPageStreams', ({ examId, peerId, page, studentIds }) => {
+    const roomId = `exam-${examId}`;
+    
     try {
       if (rooms.has(roomId)) {
         const room = rooms.get(roomId);
-        const paginatedData = room.getPaginatedProducersData(page);
-
-        socket.emit('pageChanged', {
-          producers: paginatedData.producers,
-          pagination: paginatedData.pagination,
-          workerIndex: room.workerIndex,
-          totals: {
-            camera: paginatedData.producers.camera.length,
-            screen: paginatedData.producers.screen.length,
-            total: paginatedData.producers.camera.length + paginatedData.producers.screen.length
+        const streams = [];
+        
+        // ✅ Get streams only for requested students
+        for (const [producerId, data] of room.producers) {
+          if (studentIds.includes(data.peerId)) {
+            const peer = room.peers.get(data.peerId);
+            streams.push({
+              producerId,
+              peerId: data.peerId,
+              kind: data.producer.kind,
+              streamType: data.streamType,
+              userName: peer ? peer.getUserName() : data.peerId
+            });
           }
+        }
+        
+        socket.emit('pageStreamsData', {
+          page: page,
+          streams: streams,
+          examId: examId
         });
-      } else {
-        socket.emit('pageChangeError', { error: 'Room not found', examId, page });
+        
+        console.log(`📄 Sent ${streams.length} streams for page ${page} to ${peerId}`);
       }
-    } catch (pageError) {
-      socket.emit('pageChangeError', { error: pageError.message, examId, page });
+    } catch (error) {
+      console.error(`❌ Page streams request error:`, error);
     }
   });
+
+  // Keep existing socket handlers with worker support
+socket.on('refreshProducers', ({ examId, peerId, page }) => {
+  try {
+    const roomId = `exam-${examId}`;
+    const room = rooms.get(roomId);
+    
+    if (!room) {
+      socket.emit('error', { message: 'Room not found' });
+      return;
+    }
+
+    console.log(`🔄 Refresh request: ${peerId} refreshing page ${page}`);
+    
+    // ✅ CRITICAL: Get data for the specified page
+    const paginatedData = room.getPaginatedProducersData(page);
+    
+    console.log(`📊 Refresh page ${page} data:`, {
+      totalStudents: paginatedData.pagination.totalStudents,
+      currentPageStudents: paginatedData.pagination.currentPageStudents,
+      cameraProducers: paginatedData.producers.camera.length,
+      screenProducers: paginatedData.producers.screen.length
+    });
+    
+    // ✅ Send batchProducers event with correct page data
+    socket.emit('batchProducers', {
+      examId,
+      peerId,
+      producers: paginatedData.producers,
+      pagination: paginatedData.pagination,
+      workerIndex: room.workerIndex,
+      totals: {
+        camera: paginatedData.producers.camera.length,
+        screen: paginatedData.producers.screen.length,
+        total: paginatedData.producers.camera.length + paginatedData.producers.screen.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Refresh producers error:', error);
+    socket.emit('error', { message: error.message });
+  }
+});
 
   socket.on('error', (error) => {
     console.error('Socket error:', error);
